@@ -1,6 +1,30 @@
 <#
 .SYNOPSIS
-  Lädt die neueste Veeam Backup & Replication (VBR) ISO herunter (via curl; bei Bedarf curl vorher herunterladen) und verifiziert MD5/SHA-1.
+  Lädt die neueste Veeam Backup & Replication (VBR) ISO herunter (via gebündelter curl) und verifiziert MD5/SHA-1.
+
+.PARAMETER OutputDir
+  Zielordner.
+
+.PARAMETER Auto
+  Ohne Rückfrage ausführen.
+
+.PARAMETER PreferBits
+  Bevorzuge BITS vor curl.
+
+.PARAMETER LookbackDays
+  Rückwärts-Suchfenster für das Datums-Suffix (Standard 60).
+
+.PARAMETER SkipHash
+  Hashprüfung überspringen.
+
+.PARAMETER CurlZipUrl
+  Quelle für curl (ZIP). Standard: curl 8.16.0_8 (win64 mingw).
+
+.PARAMETER CurlCacheDir
+  Lokaler Cache-Ordner für die gebündelte curl.exe.
+
+.PARAMETER CurlExpectedVersion
+  Erwartete curl-Version (z. B. "8.16.0"). Wenn leer, wird aus CurlZipUrl extrahiert.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -12,7 +36,8 @@ param(
   [int]$LookbackDays = 60,
   [switch]$SkipHash,
   [string]$CurlZipUrl = "https://curl.se/windows/dl-8.16.0_8/curl-8.16.0_8-win64-mingw.zip",
-  [string]$CurlCacheDir = "$PSScriptRoot\tools\curl"
+  [string]$CurlCacheDir = "$PSScriptRoot\tools\curl",
+  [string]$CurlExpectedVersion = ""
 )
 
 Set-StrictMode -Version Latest
@@ -50,6 +75,7 @@ function Get-LatestVbrInfo {
     $mVer = [regex]::Match($html, '(?is)Veeam\s*Backup\s*&\s*Replication.*?Version\s*:?\s*(?<ver>\d+\.\d+\.\d+\.\d+)')
     if (-not $mVer.Success) { throw "Konnte VBR-Block nicht parsen." }
     $verStr = $mVer.Groups['ver'].Value
+
     $mDate = [regex]::Match($html, '(?i)Date\s+(?<date>[A-Za-z]+\s+\d{1,2},\s+\d{4})')
     if ($mDate.Success) {
       $date = [datetime]::Parse($mDate.Groups['date'].Value, [Globalization.CultureInfo]::InvariantCulture)
@@ -103,32 +129,76 @@ function Find-VbrIsoUrl {
   return $null
 }
 
-# ---------- 4) curl bereitstellen ----------
+# ---------- 4) curl-Version ermitteln/erzwingen ----------
+function Get-DesiredCurlVersionFromUrl {
+  param([string]$Url)
+  if ($Url -match 'curl-(?<ver>[\d\.]+)') { return $matches['ver'] }
+  return $null
+}
+
+function Get-CurlVersion {
+  param([Parameter(Mandatory)][string]$CurlExePath)
+  try {
+    $out = & $CurlExePath --version 2>$null
+    $m = [regex]::Match($out, '^curl\s+([0-9][^\s]*)', 'IgnoreCase')
+    if ($m.Success) { return $m.Groups[1].Value }
+  } catch {}
+  return $null
+}
+
 function Ensure-Curl {
+    <#
+      Stellt IMMER die gebündelte curl bereit (ignoriert System-curl).
+      Lädt/aktualisiert, wenn nicht vorhanden oder Version abweicht.
+    #>
     [CmdletBinding()]
-    param([string]$CurlZipUrl,[string]$CacheDir)
-    $curlCmd = Get-Command curl.exe -ErrorAction SilentlyContinue | Where-Object { $_.CommandType -eq 'Application' }
-    if ($curlCmd) { return $curlCmd.Source }
-    $cachedCurl = Join-Path $CacheDir "curl.exe"
-    if (Test-Path $cachedCurl) { return $cachedCurl }
+    param([string]$CurlZipUrl,[string]$CacheDir,[string]$ExpectedVersion)
+
+    if (-not $ExpectedVersion -or $ExpectedVersion.Trim() -eq "") {
+      $ExpectedVersion = Get-DesiredCurlVersionFromUrl -Url $CurlZipUrl
+    }
 
     New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null
-    $zipPath = Join-Path $CacheDir "curl.zip"
-    Write-Info "Lade curl ZIP von $CurlZipUrl …"
-    Invoke-WebRequest -Uri $CurlZipUrl -OutFile $zipPath -UseBasicParsing
-    if (-not (Test-Path $zipPath)) { throw "Download des curl ZIP fehlgeschlagen: $CurlZipUrl" }
+    $cachedCurl = Join-Path $CacheDir "curl.exe"
 
-    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
-    try { [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $CacheDir) }
-    catch {
-      Remove-Item -LiteralPath $CacheDir -Recurse -Force -ErrorAction SilentlyContinue
-      New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null
-      [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $CacheDir)
+    $needDownload = $true
+    if (Test-Path $cachedCurl) {
+      $have = Get-CurlVersion -CurlExePath $cachedCurl
+      if ($ExpectedVersion) {
+        if ($have -and $have.StartsWith($ExpectedVersion)) { $needDownload = $false }
+      } else {
+        if ($have) { $needDownload = $false }
+      }
     }
-    $curlExe = Get-ChildItem -Path $CacheDir -Filter "curl.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $curlExe) { throw "curl.exe wurde im ZIP nicht gefunden." }
-    Copy-Item -LiteralPath $curlExe.FullName -Destination $cachedCurl -Force
-    Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+
+    if ($needDownload) {
+      Write-Info "Lade curl ZIP von $CurlZipUrl …"
+      $zipPath = Join-Path $CacheDir "curl.zip"
+      Invoke-WebRequest -Uri $CurlZipUrl -OutFile $zipPath -UseBasicParsing
+      if (-not (Test-Path $zipPath)) { throw "Download des curl ZIP fehlgeschlagen: $CurlZipUrl" }
+
+      Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+      Get-ChildItem -LiteralPath $CacheDir -Force | Where-Object { $_.Name -ne 'curl.zip' } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+      [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $CacheDir)
+
+      $curlExe = Get-ChildItem -Path $CacheDir -Filter "curl.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+      if (-not $curlExe) { throw "curl.exe wurde im ZIP nicht gefunden." }
+      Copy-Item -LiteralPath $curlExe.FullName -Destination $cachedCurl -Force
+      Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+
+      $have = Get-CurlVersion -CurlExePath $cachedCurl
+      if ($ExpectedVersion -and (-not $have -or -not $have.StartsWith($ExpectedVersion))) {
+        throw "Erwartete curl-Version $ExpectedVersion, gefunden: $have"
+      }
+      $verText = if ([string]::IsNullOrWhiteSpace($have)) { "unbekannt" } else { $have }
+      Write-Ok ("curl bereit: {0} (Version {1})" -f $cachedCurl, $verText)
+    }
+    else {
+      $have = Get-CurlVersion -CurlExePath $cachedCurl
+      $verText = if ([string]::IsNullOrWhiteSpace($have)) { "unbekannt" } else { $have }
+      Write-Info ("curl aus Cache verwendet: {0} (Version {1})" -f $cachedCurl, $verText)
+    }
+
     return $cachedCurl
 }
 
@@ -170,12 +240,11 @@ function Download-File {
         Write-Info "Download via BITS…"
         Start-BitsTransfer -Source $Url.AbsoluteUri -Destination $dest -DisplayName "VBR ISO $fileName" -Description "Download" -ErrorAction Stop
         if (Test-Path $dest) { Write-Ok "Download abgeschlossen: $dest"; return $dest }
-      } catch { Write-Warn2 "BITS fehlgeschlagen: $($_.Exception.Message). Wechsle zu curl…" }
+      } catch { Write-Warn2 "BITS fehlgeschlagen: $($_.Exception.Message). Wechsle zu gebündelter curl…" }
     }
     try {
-      
-      $curlPath = Ensure-Curl -CurlZipUrl $CurlZipUrl -CacheDir $CurlCacheDir
-      Write-Info "Benutze curl: $curlPath"
+      $curlPath = Ensure-Curl -CurlZipUrl $CurlZipUrl -CacheDir $CurlCacheDir -ExpectedVersion $CurlExpectedVersion
+      Write-Info "Benutze gebündelte curl: $curlPath"
       $null = Invoke-CurlDownload -CurlPath $curlPath -Url $Url.AbsoluteUri -DestinationPath $dest
       if (Test-Path $dest) { return $dest }
     } catch { Write-Warn2 "curl-Download fehlgeschlagen: $($_.Exception.Message)" }
